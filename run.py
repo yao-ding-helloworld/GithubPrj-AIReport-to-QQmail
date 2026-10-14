@@ -110,10 +110,14 @@ def main(argv=None):
         try:
             import digest
             import notify
-            text = digest.render_digest(conn, periods=periods, top_n=args.top)
+            # 摘要只覆盖一个窗口（默认周榜），月/季榜在附件报告里
+            period_key = periods[0] if periods else "weekly"
+            text = digest.render_digest(conn, period_key=period_key, top_n=3)
             notify.send_digest(text, html_path=report_path, verbose=verbose)
-        except ImportError as exc:
-            print("[!] 推送模块尚未就绪：%s" % exc)
+        except Exception as exc:                            # noqa: BLE001
+            # 规格要求：推送失败不得导致整体运行失败（报告与快照已落盘）
+            print("[!] 推送环节异常，但不影响本次运行结果：%s: %s"
+                  % (type(exc).__name__, exc))
 
     if verbose:
         print("-" * 62)
