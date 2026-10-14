@@ -150,6 +150,37 @@ def describe_smtp():
     )
 
 
+# ---------------------------------------------------------------- LLM（可选）
+LLM_REQUIRED = ["LLM_API_KEY"]
+
+
+def llm_settings():
+    """读 LLM 配置；未配置返回 None（调用方自动降级为规则版简介）。
+
+    用 OpenAI 兼容的 /chat/completions 协议，所以 OpenAI / DeepSeek / 通义 /
+    智谱 / 本地 vLLM 都能直接接——只要改 base_url + model。
+    """
+    key = get("LLM_API_KEY")
+    if not key:
+        return None
+    base = (get("LLM_BASE_URL") or "https://api.deepseek.com/v1").rstrip("/")
+    return {
+        "base_url": base,
+        "key": key,
+        "model": get("LLM_MODEL", "deepseek-chat"),
+        "timeout": int(get("LLM_TIMEOUT", "60")),
+    }
+
+
+def describe_llm():
+    settings = llm_settings()
+    if not settings:
+        return ("项目简介：规则版（未配置 LLM_API_KEY）\n"
+                "  想要真正的中文简介，在 .env 补 LLM_API_KEY / LLM_BASE_URL / LLM_MODEL")
+    return "项目简介：LLM 版（%s @ %s → %s）" % (
+        settings["model"], settings["base_url"], mask(settings["key"]))
+
+
 # ---------------------------------------------------------------- 输出目录
 def ensure_dirs():
     """确保数据目录与产物目录存在。"""
@@ -161,3 +192,4 @@ if __name__ == "__main__":
     load_env()
     print(describe_github())
     print(describe_smtp())
+    print(describe_llm())

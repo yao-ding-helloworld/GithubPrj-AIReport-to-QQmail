@@ -108,8 +108,13 @@ def _row_html(item, rank, max_value):
     bar = 3
     if max_value > 0:
         bar = max(3, int(round(abs(item.get("value") or 0) * 100.0 / max_value)))
-    desc = ('<div class="desc">%s</div>' % _esc(item.get("description"))
-            if item.get("description") else "")
+    # 优先展示中文简介；原始英文描述挂到 title 上（鼠标悬停可见）
+    summary = item.get("summary") or ""
+    description = item.get("description") or ""
+    text_line = summary or description
+    title_attr = (' title="%s"' % _esc(description)) if (summary and description) else ""
+    desc = ('<div class="desc"%s>%s</div>' % (title_attr, _esc(text_line))) \
+        if text_line else ""
     lang = ('<span class="lang">%s</span>' % _esc(item.get("language"))
             if item.get("language") else "")
     name = item.get("full_name") or ""
@@ -395,7 +400,10 @@ function rowHTML(item, rank, max) {
   }
   const est = item.estimated ? '<span class="est" title="超大仓库分页受限，回溯值可能偏低">估</span>' : "";
   const barW = max > 0 ? Math.max(3, Math.round(Math.abs(item.value) / max * 100)) : 3;
-  const desc = item.description ? '<div class="desc">' + esc(item.description) + '</div>' : "";
+  const textLine = item.summary || item.description || "";
+  const tip = (item.summary && item.description)
+    ? ' title="' + esc(item.description) + '"' : "";
+  const desc = textLine ? '<div class="desc"' + tip + '>' + esc(textLine) + '</div>' : "";
   const lang = item.language ? '<span class="lang">' + esc(item.language) + '</span>' : "";
   return '<tr>' +
     '<td class="rk' + (rank <= 3 ? " top" : "") + '">' + rank + '</td>' +

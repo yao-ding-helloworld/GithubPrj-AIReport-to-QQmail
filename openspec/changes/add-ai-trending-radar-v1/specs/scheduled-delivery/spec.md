@@ -25,7 +25,45 @@
 ### Scenario: 摘要 + 报告附件送达
 - **GIVEN** 配置了 `SMTP_HOST` / `SMTP_USER` / `SMTP_PASS` / `MAIL_TO`，且已生成 `report.html`
 - **WHEN** 执行推送
-- **THEN** 以 `smtplib.SMTP_SSL`（端口 465）登录并发送 `EmailMessage`：正文为摘要（纯文本 + 简易 HTML 双份），`report.html` 作为 MIME 附件（`add_attachment`，`maintype='text'`、`subtype='html'`），主体编码 UTF-8，主题形如 `[AI 开源雷达] 周榜 · 2026-10-14`
+- **THEN** 以 `smtplib.SMTP_SSL`（端口 465）登录并发送 `EmailMessage`：正文为**移动优先的 HTML 邮件**（单列、内联样式、零 JS、零外部资源）＋ 纯文本分支，`report.html` 作为 MIME 附件（`add_attachment`，`maintype='text'`、`subtype='html'`），主体编码 UTF-8，主题形如 `[AI 开源雷达] 周榜 · 2026-10-14`
+
+### Scenario: 手机端不点附件也能看全内容
+- **GIVEN** 用户在 iOS 邮件客户端打开快报，且不点开附件
+- **WHEN** 渲染邮件正文
+- **THEN** 正文自带每领域「趋势 Top N + 热度 Top N」的完整列表（项目名可点、star、窗口增量、增速、一句话简介），单列排版不做横向溢出；不得依赖 JavaScript、flex/grid、position:sticky 或任何外部资源（iOS 预览 HTML 附件**不执行 JS**，靠 JS 渲染的页面在手机上就是空壳）
+
+### Scenario: 摘要只覆盖一个窗口
+- **GIVEN** 报告内含周/月/季三个窗口
+- **WHEN** 生成邮件摘要
+- **THEN** 正文只呈现一个窗口（默认周榜）的 Top N，并在页脚说明"完整榜单见附件"，避免正文过长
+
+## ADDED Requirement: 项目简介
+
+系统 SHALL 为出现在榜单上的仓库生成一句话简介，并同时呈现在邮件正文与报告中。
+
+### Scenario: 规则版简介（默认，零依赖）
+- **GIVEN** 未配置 `LLM_API_KEY`
+- **WHEN** 生成简介
+- **THEN** 用「主要语言 · 所属领域方向。＋ 描述首句（英文原文）」拼出一句中文骨架，截断至 `SUMMARY_MAX_CHARS`，不调用任何外部接口
+
+### Scenario: LLM 版简介（配置后自动启用）
+- **GIVEN** 配置了 `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL`
+- **WHEN** 生成简介
+- **THEN** 调用 OpenAI 兼容的 `/chat/completions` 把项目信息压成一句不超过 40 字的中文简介
+
+### Scenario: 简介缓存（控制花费）
+- **GIVEN** 某仓库的描述/主题/语言均未变化
+- **WHEN** 再次运行
+- **THEN** 命中内容指纹缓存，不重复调用 LLM；缓存字段随快照 CSV 一起持久化，云端重建库后依然命中
+
+### Scenario: 简介只覆盖会展示的仓库
+- **GIVEN** 候选池有 900+ 个仓库，但报告只展示各领域 Top N
+- **WHEN** 生成简介
+- **THEN** 只对榜单实际出现的仓库生成（约数十条），不为整个候选池生成
+
+### Scenario: 写入自校验
+- **WHEN** 写入简介
+- **THEN** 记录**实际生效行数**并与待写条数比对，若待写 >0 而生效 =0 则显式报错，不得静默成功
 
 ### Scenario: 只发摘要，不内联报告
 - **WHEN** 构造邮件

@@ -44,10 +44,12 @@ class ConsoleProvider(object):
     def available(self):
         return True
 
-    def send(self, subject, markdown, html_path=None):
+    def send(self, subject, markdown, html_body=None, html_path=None):
         print("-" * 62)
         print("[控制台推送] 主题：%s" % subject)
         print(markdown)
+        if html_body:
+            print("[控制台推送] HTML 分支：%d 字符（未打印）" % len(html_body))
         if html_path and Path(html_path).exists():
             print("[控制台推送] 附件（未发送）：%s" % html_path)
         print("-" * 62)
@@ -65,7 +67,7 @@ class EmailProvider(object):
     def available(self):
         return bool(self.settings and self.settings.get("to"))
 
-    def build_message(self, subject, markdown, html_path=None):
+    def build_message(self, subject, markdown, html_body=None, html_path=None):
         import digest                      # 局部导入，避免与 run.py 形成环
 
         settings = self.settings
@@ -75,8 +77,10 @@ class EmailProvider(object):
         msg["To"] = ", ".join(settings["to"])
         msg["Date"] = formatdate(localtime=True)
 
-        msg.set_content(markdown)                                   # 纯文本版本
-        msg.add_alternative(digest.md_to_html(markdown), subtype="html")
+        msg.set_content(markdown)                                   # 纯文本分支
+        # HTML 分支：正文优先用调用方给的移动版 HTML；没给则退回 markdown 转换
+        msg.add_alternative(html_body or digest.md_to_html(markdown),
+                            subtype="html")
 
         note = []
         if html_path:
@@ -95,11 +99,12 @@ class EmailProvider(object):
             note.append("无附件")
         return msg, "；".join(note)
 
-    def send(self, subject, markdown, html_path=None, retries=2):
+    def send(self, subject, markdown, html_body=None, html_path=None, retries=2):
         if not self.available():
             return NotifyResult(False, self.name, "未配置 SMTP")
 
-        msg, note = self.build_message(subject, markdown, html_path)
+        msg, note = self.build_message(subject, markdown, html_body=html_body,
+                                       html_path=html_path)
         settings = self.settings
         attempt = 0
         last_error = ""
@@ -142,7 +147,7 @@ def choose_provider():
     return email if email.available() else ConsoleProvider()
 
 
-def send_digest(markdown, subject=None, html_path=None, verbose=True):
+def send_digest(markdown, subject=None, html_body=None, html_path=None, verbose=True):
     """把摘要推送出去。返回 NotifyResult；失败不抛异常。"""
     import digest
 
@@ -153,7 +158,8 @@ def send_digest(markdown, subject=None, html_path=None, verbose=True):
         print("推送通道：%s" % provider.name)
 
     try:
-        result = provider.send(subject, markdown, html_path=html_path)
+        result = provider.send(subject, markdown, html_body=html_body,
+                               html_path=html_path)
     except Exception as exc:                                    # noqa: BLE001
         result = NotifyResult(False, getattr(provider, "name", "unknown"),
                               "未捕获异常：%s" % exc)

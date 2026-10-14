@@ -23,7 +23,10 @@ TABLES = {
     "repos": {
         "file": config.REPOS_CSV,
         "columns": ["repo_id", "full_name", "description", "language", "topics",
-                    "domain", "secondary", "stars", "first_seen", "updated_at"],
+                    "domain", "secondary", "stars", "first_seen", "updated_at",
+                    # 简介必须随 CSV 走：否则云端每次重建库都会丢掉，
+                    # 于是每天重复调用 LLM（白花钱）
+                    "summary", "summary_hash"],
     },
     "snapshots": {
         "file": config.SNAPSHOT_CSV,

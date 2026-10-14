@@ -209,5 +209,14 @@ def clean_text(text, limit=None):
     return text[:limit]
 
 
+# ---------------------------------------------------------------- 邮件
+MAIL_TOP_N = 3             # 邮件正文里每个榜单放几条（手机上一屏能看完）
+MAIL_MAX_ITEMS = 3         # 每个榜单最多几条（超长时压缩用）
+
+# ---------------------------------------------------------------- 项目简介
+SUMMARY_ENABLED = True
+SUMMARY_MAX_CHARS = 78     # 简介最大长度；手机端一行半左右
+SUMMARY_LLM_LIMIT = 300    # 单次运行最多调用 LLM 几次（控制花费）
+
 # 兜底领域：规则全不命中时的归属（不参与榜单展示，只看占比）
 FALLBACK_DOMAIN = "other"

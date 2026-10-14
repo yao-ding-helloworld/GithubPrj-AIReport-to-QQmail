@@ -21,6 +21,45 @@ import net
 # 回溯阶段的请求计数器（跨仓库累计，防止失控烧额度）
 _backfill_requests = [0]
 
+# 回溯可用性：None=未探测 / True=可用 / False=不可用
+# 实测教训：某些环境里 /repos/{o}/{r}/stargazers 直接 404，或者忽略 star+json
+# 请求头返回不带 starred_at 的裸用户对象。此时若继续跑，会把额度全烧在
+# 注定失败的请求上（曾经一次烧掉 600 次请求、耗时数分钟、结果全是 0 增量）。
+_backfill_available = [None]
+
+
+def probe_backfill(repos, verbose=True):
+    """先花 1~3 次请求探一下 stargazers 到底能不能用。"""
+    if _backfill_available[0] is not None:
+        return _backfill_available[0]
+
+    for repo in repos[:3]:
+        try:
+            entries = net.stargazers(repo["full_name"], 1, per_page=5)
+        except Exception as exc:                            # noqa: BLE001
+            if verbose:
+                print("  [!] 回溯探测失败（%s）：%s" % (repo["full_name"], exc))
+            continue
+        if not isinstance(entries, list):
+            continue
+        if not entries:
+            continue
+        if any("starred_at" in entry for entry in entries):
+            _backfill_available[0] = True
+            if verbose:
+                print("  [i] 回溯探测通过：stargazers 返回带 starred_at，可用")
+            return True
+        _backfill_available[0] = False
+        if verbose:
+            print("  [!] stargazers 返回的条目没有 starred_at 字段"
+                  "（star+json 未被支持），回溯不可用")
+        return False
+
+    _backfill_available[0] = False
+    if verbose:
+        print("  [!] stargazers 接口不可用（404 或无数据），本次跳过回溯")
+    return False
+
 
 # ---------------------------------------------------------------- 查询构建
 def render_query(query, today=None):
@@ -147,6 +186,8 @@ def backfill_windows(full_name, stars, periods=None):
     periods = periods or list(config.PERIODS)
     if not config.BACKFILL_ENABLED or env.github_mode() != "token":
         return None, False
+    if _backfill_available[0] is False:       # 已知不可用，别再浪费请求
+        return None, False
     if stars > config.BACKFILL_STAR_CEILING:
         return None, True
 
@@ -236,6 +277,12 @@ def collect(conn, domains=None, snap_date=None, do_backfill=None, max_queries=No
     }
 
     # ---- 趋势冷启动回溯 ----
+    if do_backfill and repos:
+        # 先探测接口可用性，避免把额度烧在注定失败的请求上
+        if not probe_backfill(repos, verbose=verbose):
+            do_backfill = False
+            result["backfill_skipped"] = True
+
     if do_backfill and repos:
         rows = []
         for repo in repos:

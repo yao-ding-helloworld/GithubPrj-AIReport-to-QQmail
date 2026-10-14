@@ -27,7 +27,9 @@ CREATE TABLE IF NOT EXISTS repos (
     secondary   TEXT,              -- JSON 数组，次要领域（不参与榜单）
     stars       INTEGER,           -- 最近一次采集到的 star 总量
     first_seen  TEXT,              -- ISO 日期，首次进入候选池
-    updated_at  TEXT
+    updated_at  TEXT,
+    summary      TEXT,             -- 一句话项目简介（summarize.py 生成）
+    summary_hash TEXT              -- 生成简介所依据内容的指纹
 );
 
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -78,11 +80,21 @@ def connect(path=None):
 
 
 def init(path=None):
-    """建表 + 建索引，可重复调用。返回连接对象。"""
+    """建表 + 建索引 + 轻量迁移，可重复调用。返回连接对象。"""
     conn = connect(path)
     conn.executescript(SCHEMA)
+    migrate(conn)
     conn.commit()
     return conn
+
+
+def migrate(conn):
+    """给老库补列（SQLite 没有 ADD COLUMN IF NOT EXISTS，只能先查再改）。"""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(repos)")}
+    for name, ddl in (("summary", "TEXT"),        # 项目一句话简介
+                      ("summary_hash", "TEXT")):  # 简介依据的指纹，变了才重算
+        if name not in columns:
+            conn.execute("ALTER TABLE repos ADD COLUMN %s %s" % (name, ddl))
 
 
 # ---------------------------------------------------------------- 写入
@@ -183,15 +195,25 @@ def set_meta(conn, key, value):
 
 
 def iter_repos(conn):
-    """遍历全部仓库主档（dict 形式，topics/secondary 已反序列化）。"""
-    for row in conn.execute("SELECT * FROM repos ORDER BY stars DESC"):
+    """返回全部仓库主档（list，topic/secondary 已反序列化）。
+
+    注意：**这里必须一次性取回成 list，不能写成生成器。**
+    踩过的坑：以前写成 `for row in conn.execute(...): yield item`，
+    调用方 `next(...)` 只取一条就走时，SQLite 游标会一直挂着，
+    之后同一个连接上的 UPDATE 全部**静默不生效**（不报错、rowcount 也不可靠），
+    排查了很久。仓库总共也就千把行，物化没有任何成本。
+    """
+    rows = conn.execute("SELECT * FROM repos ORDER BY stars DESC").fetchall()
+    items = []
+    for row in rows:
         item = dict(row)
         for key in ("topics", "secondary"):
             try:
                 item[key] = json.loads(item[key]) if item[key] else []
             except (TypeError, ValueError):
                 item[key] = []
-        yield item
+        items.append(item)
+    return items
 
 
 def snapshot_on(conn, repo_id, snap_date):
@@ -237,12 +259,37 @@ def snapshot_series(conn, repo_id, limit=30):
 def window_rows(conn, period):
     """取某窗口的全部增量记录，按降序返回。"""
     rows = conn.execute(
-        "SELECT w.*, r.full_name, r.domain, r.language, r.stars, r.description "
+        "SELECT w.*, r.full_name, r.domain, r.language, r.stars, r.description, "
+        "       r.summary, r.topics "
         "FROM windows w JOIN repos r ON r.repo_id = w.repo_id "
         "WHERE w.period=? ORDER BY w.stars_delta DESC",
         (period,),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def set_summaries(conn, pairs):
+    """批量写项目简介。pairs = [(repo_id, summary, summary_hash), ...]
+
+    返回**实际被修改的行数**（而不是 len(pairs)）——曾经因为返回 len(pairs)
+    掩盖了"UPDATE 没匹配到任何行"的问题，排查了很久。写完再回读一次做校验。
+    """
+    applied = 0
+    for repo_id, summary, summary_hash in pairs:
+        cursor = conn.execute(
+            "UPDATE repos SET summary=?, summary_hash=? WHERE repo_id=?",
+            (summary, summary_hash, repo_id))
+        if cursor.rowcount and cursor.rowcount > 0:
+            applied += 1
+    conn.commit()
+    return applied
+
+
+def count_summaries(conn):
+    """库内有非空简介的行数（写入校验用）。"""
+    return conn.execute(
+        "SELECT COUNT(*) FROM repos WHERE summary IS NOT NULL AND summary<>''"
+    ).fetchone()[0]
 
 
 def stats(conn):
