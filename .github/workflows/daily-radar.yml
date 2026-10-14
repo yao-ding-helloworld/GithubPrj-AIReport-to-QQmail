@@ -1,0 +1,80 @@
+name: AI 开源雷达 · 每日采集与快报
+
+on:
+  schedule:
+    # cron 用 UTC：01:00 UTC = 北京时间 09:00
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+    inputs:
+      notify:
+        description: 是否发送邮件快报
+        type: boolean
+        default: true
+
+permissions:
+  contents: write          # 提交快照 CSV 需要写权限
+
+concurrency:
+  group: daily-radar
+  cancel-in-progress: false
+
+jobs:
+  radar:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 重建快照库（CSV → SQLite）
+        run: python persist.py import
+
+      - name: 采集 → 分类 → 指标 → 报告 → 推送
+        env:
+          # Secrets 名与本地 .env 变量名保持一致，同一份代码两地可跑
+          GH_API_TOKEN: ${{ secrets.GH_API_TOKEN }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.notify }}" = "false" ]; then
+            python run.py
+          else
+            python run.py --notify
+          fi
+
+      - name: 导出快照并提交回仓库
+        run: |
+          python persist.py export
+          git config user.name "radar-bot"
+          git config user.email "radar-bot@users.noreply.github.com"
+          git add .data/*.csv
+          if git diff --staged --quiet; then
+            echo "快照无变化，跳过提交"
+          else
+            git commit -m "snapshot: $(date -u +%Y-%m-%d) 每日采集快照"
+            git push
+          fi
+
+      - name: 上传报告产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-trending-report
+          path: dist/report.html
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: 汇总
+        if: always()
+        run: |
+          echo "### AI 开源雷达运行结束" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          python persist.py status >> $GITHUB_STEP_SUMMARY || true

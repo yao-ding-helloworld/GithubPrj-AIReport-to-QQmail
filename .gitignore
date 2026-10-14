@@ -1,0 +1,28 @@
+# 密钥（绝不入库）
+.env
+
+# 数据目录走白名单：只提交快照 CSV（云端持久化载体，见 design.md ADR-9），
+# 其余（SQLite、自检输出、临时文件、诊断日志）一律忽略。
+# 白名单写法比一个个排除更稳——新加的输出文件不会再有被误提交的机会。
+.data/*
+!.data/repos.csv
+!.data/snapshots.csv
+!.data/windows.csv
+
+# 报告产物
+dist/
+report.html
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 兜底：万一有临时日志写在根目录
+ls_tmp.txt
+out.txt
+out_*.txt
+run_out.txt
+gitlog*.txt
+net.txt
+remote*.txt
+smoke_out.txt
