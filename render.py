@@ -981,6 +981,16 @@ def render(conn, out_path=None, periods=None, top_n=None, domains=None, verbose=
     text = text.replace("__DATA__", data_json)
 
     out.write_text(text, encoding="utf-8")
+
+    # 同步一份到 docs/：GitHub Pages 直接托管这个目录。
+    # 好处是链接固定、内容随每日 workflow 的提交自动更新，不需要手动重新发布。
+    # `.nojekyll` 是给 Pages 看的：别拿 Jekyll 处理我们的产物。
+    docs = config.ROOT / "docs"
+    docs.mkdir(parents=True, exist_ok=True)
+    (docs / "index.html").write_text(text, encoding="utf-8")
+    (docs / ".nojekyll").write_text("", encoding="utf-8")
+
     if verbose:
         print("报告已生成：%s（%.1f KB）" % (out, out.stat().st_size / 1024.0))
+        print("已同步到 %s（GitHub Pages 托管目录）" % (docs / "index.html"))
     return out

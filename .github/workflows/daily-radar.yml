@@ -65,11 +65,13 @@ jobs:
           python persist.py export
           git config user.name "radar-bot"
           git config user.email "radar-bot@users.noreply.github.com"
-          git add .data/*.csv
+          # docs/ 是 GitHub Pages 的托管目录：run.py 已把最新报告写成 docs/index.html，
+          # 提交后 Pages 上的链接内容当天就更新，不需要任何手动发布动作
+          git add .data/*.csv docs/
           if git diff --staged --quiet; then
-            echo "快照无变化，跳过提交"
+            echo "快照与报告均无变化，跳过提交"
           else
-            git commit -m "snapshot: $(date -u +%Y-%m-%d) 每日采集快照"
+            git commit -m "snapshot: $(date -u +%Y-%m-%d) 每日采集快照与报告"
             git push
           fi
 
