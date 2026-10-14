@@ -30,12 +30,17 @@ LAST_LLM_ERROR = [None]
 
 
 # ---------------------------------------------------------------- 指纹
-def content_hash(repo):
-    """简介依据的内容指纹：描述 / 主题 / 语言变了才需要重算。"""
+def content_hash(repo, mode_sig="rule"):
+    """简介依据的内容指纹：描述 / 主题 / 语言 / **生成模式** 变了才需要重算。
+
+    为什么要把模式算进去：从"规则版"切到"LLM 版"时，仓库内容一个字都没变，
+    如果指纹只算内容，就会命中缓存、永远停留在旧的规则版简介上。
+    """
     basis = "|".join([
         (repo.get("description") or "")[:400],
         ",".join(sorted(repo.get("topics") or [])),
         repo.get("language") or "",
+        "mode=" + mode_sig,
     ])
     return hashlib.sha1(basis.encode("utf-8")).hexdigest()
 
@@ -83,23 +88,9 @@ SYSTEM_PROMPT = (
 )
 
 
-def llm_summary(repo, settings):
-    """调用 OpenAI 兼容接口生成中文简介；失败返回 None（由调用方降级）。"""
-    topics = "、".join((repo.get("topics") or [])[:6])
-    user_prompt = (
-        "项目名：%s\n主要语言：%s\n主题标签：%s\n英文描述：%s"
-        % (repo.get("full_name") or "", repo.get("language") or "-",
-           topics or "-", (repo.get("description") or "-")[:400])
-    )
-    payload = {
-        "model": settings["model"],
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": 0.3,
-        "max_tokens": 160,
-    }
+def _post(settings, payload, max_tokens):
+    """发一次请求，返回 (是否成功, content 或 None, 失败原因)。"""
+    payload = dict(payload, max_tokens=max_tokens)
     req = urllib.request.Request(
         settings["base_url"] + "/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
@@ -112,20 +103,64 @@ def llm_summary(repo, settings):
     try:
         with urllib.request.urlopen(req, timeout=settings["timeout"]) as resp:
             data = json.loads(resp.read().decode("utf-8", "replace"))
-        text = data["choices"][0]["message"]["content"]
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", "replace")[:200]
-        LAST_LLM_ERROR[0] = "HTTP %s %s" % (exc.code, body)
-        return None
+        return False, None, "HTTP %s %s" % (exc.code, body)
     except Exception as exc:                                # noqa: BLE001
-        LAST_LLM_ERROR[0] = "%s: %s" % (type(exc).__name__, exc)
-        return None
+        return False, None, "%s: %s" % (type(exc).__name__, exc)
 
-    text = re.sub(r"^[\s\"'“”‘’]+|[\s\"'“”‘’]+$", "", text or "")
+    try:
+        choice = data["choices"][0]
+        text = choice["message"].get("content") or ""
+    except (KeyError, IndexError, AttributeError):
+        return False, None, ("响应结构异常：%s"
+                             % json.dumps(data, ensure_ascii=False)[:200])
+
+    # 推理被截断 → 失败。宁可降级成规则版，也不要写一条空简介
+    if choice.get("finish_reason") == "length":
+        reasoning = choice["message"].get("reasoning_content") or ""
+        return False, None, ("被 max_tokens 截断（当前 %d，推理已占 %d 字符）"
+                            % (max_tokens, len(reasoning)))
+
+    text = re.sub(r"^[\s\"'“”‘’]+|[\s\"'“”‘’]+$", "", text)
     text = text.replace("\n", " ").strip()
     if not text:
+        return False, None, ("模型返回空内容（finish_reason=%s）"
+                            % choice.get("finish_reason"))
+    return True, truncate(text, config.SUMMARY_MAX_CHARS), None
+
+
+def llm_summary(repo, settings):
+    """调用 OpenAI 兼容接口生成中文简介；失败返回 None（由调用方降级）。
+
+    推理型模型的思考长度不可预测，所以**截断时自动加倍重试一次**，
+    而不是让用户去猜 SUMMARY_MAX_TOKENS 该填多少。
+    """
+    topics = "、".join((repo.get("topics") or [])[:6])
+    payload = {
+        "model": settings["model"],
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": (
+                "项目名：%s\n主要语言：%s\n主题标签：%s\n英文描述：%s"
+                % (repo.get("full_name") or "", repo.get("language") or "-",
+                   topics or "-", (repo.get("description") or "-")[:400]))},
+        ],
+        "temperature": 0.3,
+    }
+
+    budget = config.SUMMARY_MAX_TOKENS
+    for attempt in (1, 2):
+        ok, text, reason = _post(settings, payload, budget)
+        if ok:
+            LAST_LLM_ERROR[0] = None      # 重试成功后要清掉上一次的失败原因，
+            return text                   # 否则日志里会残留一条误导性的 [!]
+        LAST_LLM_ERROR[0] = reason
+        if "截断" in (reason or "") and attempt == 1:
+            budget = min(budget * 2, 4096)
+            continue
         return None
-    return truncate(text, config.SUMMARY_MAX_CHARS)
+    return None
 
 
 # ---------------------------------------------------------------- 主入口
@@ -137,6 +172,8 @@ def summarize_repos(conn, repos=None, force=False, limit=None, verbose=True):
     """
     settings = env.llm_settings()
     mode = "llm" if settings else "rule"
+    # 模式进指纹：换模型或换模式都会触发重算，不会卡在旧版本上
+    mode_sig = ("llm:" + settings["model"]) if settings else "rule"
     limit = config.SUMMARY_LLM_LIMIT if limit is None else limit
     candidates = repos if repos is not None else list(db.iter_repos(conn))
 
@@ -144,22 +181,30 @@ def summarize_repos(conn, repos=None, force=False, limit=None, verbose=True):
     reused = 0
     generated = 0
     llm_calls = 0
+    fallbacks = 0
     domain_names = {d["key"]: d["name"] for d in config.DOMAINS}
 
     for repo in candidates:
-        digest = content_hash(repo)
+        digest = content_hash(repo, mode_sig)
         if not force and repo.get("summary") and repo.get("summary_hash") == digest:
             reused += 1
             continue
 
         text = None
+        actual_sig = mode_sig
         if settings and llm_calls < limit:
             text = llm_summary(repo, settings)
             if text:
                 llm_calls += 1
+            else:
+                # 降级项用「规则版指纹」存：下次运行会因指纹不匹配而重试 LLM，
+                # 否则失败一次就被永久缓存成规则版了。
+                fallbacks += 1
+                actual_sig = "rule"
         if not text:
             text = rule_summary(repo, domain_names.get(repo.get("domain")))
-        updates.append((repo["repo_id"], text, digest))
+        updates.append((repo["repo_id"], text,
+                        content_hash(repo, actual_sig)))
         generated += 1
 
     applied = db.set_summaries(conn, updates) if updates else 0
@@ -173,14 +218,15 @@ def summarize_repos(conn, repos=None, force=False, limit=None, verbose=True):
             print("  [FAIL] 有 %d 条待写却一行都没生效 —— repo_id 对不上或连接异常"
                   % len(updates))
         if mode == "llm":
-            print("  LLM 调用 %d 次（上限 %d）" % (llm_calls, limit))
+            print("  LLM 调用成功 %d 次（上限 %d），降级 %d 条"
+                  % (llm_calls, limit, fallbacks))
             if LAST_LLM_ERROR[0]:
                 print("  [!] 有调用失败，已降级为规则版：%s" % LAST_LLM_ERROR[0])
         else:
             print("  " + env.describe_llm().replace("\n", "\n  "))
 
     return {"mode": mode, "generated": generated, "reused": reused,
-            "applied": applied, "total": total,
+            "applied": applied, "total": total, "fallbacks": fallbacks,
             "llm_calls": llm_calls, "error": LAST_LLM_ERROR[0]}
 
 

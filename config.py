@@ -218,5 +218,12 @@ SUMMARY_ENABLED = True
 SUMMARY_MAX_CHARS = 78     # 简介最大长度；手机端一行半左右
 SUMMARY_LLM_LIMIT = 300    # 单次运行最多调用 LLM 几次（控制花费）
 
+# LLM 的 max_tokens。**必须给足**：像 deepseek-flash 这类推理型模型，
+# max_tokens 是「思考 + 答案」共用的额度，实测一句 20 字简介要烧掉 500~1800 个
+# 推理 token。给 160 会让答案被思考挤没，content 直接返回空字符串
+# （finish_reason=length），而且不报错——非常难查。
+# 代码里对"被截断"会自动加倍重试一次（上限 4096），所以这里给个够用的基准即可。
+SUMMARY_MAX_TOKENS = 2048
+
 # 兜底领域：规则全不命中时的归属（不参与榜单展示，只看占比）
 FALLBACK_DOMAIN = "other"
