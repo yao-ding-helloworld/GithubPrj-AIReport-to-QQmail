@@ -120,13 +120,20 @@ def commit_object_bytes(tree, parents, author_epoch, committer_epoch,
     return body, hashlib.sha1(body).hexdigest()
 
 
-def index_entries():
+def index_entries(code_only=False):
+    """从索引取要上传的文件。
+
+    code_only=True 时跳过 .data/ 下的快照 CSV —— 那些是**云端工作流自己维护的数据**，
+    本机推送代码时不该覆盖它们（否则会把云端刚提交的快照回退成本机的旧版本）。
+    """
     entries = []
     for line in git("ls-files", "-s").splitlines():
         if not line.strip():
             continue
         meta, path = line.split("\t", 1)
         mode, blob_sha, _stage = meta.split()
+        if code_only and path.startswith(".data/"):
+            continue
         entries.append((mode, blob_sha, path))
     return entries
 
@@ -203,7 +210,18 @@ def main():
     say("")
 
     # ---- 2. 上传 blob ----
-    entries = index_entries()
+    code_only = "--code-only" in sys.argv
+    base_tree = None
+    if code_only:
+        status, rcommit = api("GET", "%s/git/commits/%s" % (base, remote_sha), token)
+        if status == 200:
+            base_tree = rcommit["tree"]["sha"]
+        say("模式：只推代码（.data/ 快照 CSV 保持云端的版本不动）")
+        if base_tree:
+            say("      tree 以远端 %s 为基底" % base_tree)
+    say("")
+
+    entries = index_entries(code_only=code_only)
     say("上传 %d 个文件：" % len(entries))
     tree_entries = []
     for i, (mode, blob_sha, path) in enumerate(entries, 1):
@@ -221,15 +239,17 @@ def main():
     say("")
 
     # ---- 3. tree ----
-    status, tree = api("POST", "%s/git/trees" % base, token, {"tree": tree_entries})
+    payload_tree = {"tree": tree_entries}
+    if base_tree:
+        payload_tree["base_tree"] = base_tree
+    status, tree = api("POST", "%s/git/trees" % base, token, payload_tree)
     if status not in (200, 201):
         say("[FAIL] 创建 tree：HTTP %s %s" % (status, tree))
         return flush(1)
-    if tree["sha"] != fields["tree"]:
-        say("[!] 新 tree %s 与本地 %s 不同（有未提交改动，属正常）"
-            % (tree["sha"][:7], fields["tree"][:7]))
-    else:
+    if not code_only and tree["sha"] == fields["tree"]:
         say("[i] tree 与本地一致：%s" % tree["sha"])
+    else:
+        say("[i] 新 tree：%s" % tree["sha"])
     say("")
 
     # ---- 4. commit（先本地预算 sha 做自校验）----

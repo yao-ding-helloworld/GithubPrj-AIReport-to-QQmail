@@ -67,6 +67,102 @@ def sparkline(series, width=132, height=30):
     )
 
 
+# ---------------------------------------------------------------- 静态预渲染
+# 为什么要有这一段：
+# 页面原本完全靠 JS 渲染，一旦渲染环境禁用内联脚本（预览面板、邮件客户端预览、
+# 严格 CSP），页面就只剩"空架子"——结构在、榜单区一片空白。
+# 所以构建时就把默认视图（周榜的 趋势榜 + 热度榜）编译成静态 HTML 塞进去；
+# 脚本可用时 render() 会立即覆盖它，脚本被禁时这就是最终内容。
+# 纯增强，不牺牲交互。
+
+def _esc(text):
+    return html.escape(str(text if text is not None else ""), quote=True)
+
+
+def _fmt_delta(value):
+    if value is None:
+        return "-"
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return "-"
+    sign = "+" if value > 0 else ("-" if value < 0 else "")
+    return sign + fmt_stars(abs(value))
+
+
+def _row_html(item, rank, max_value):
+    delta = item.get("delta")
+    if delta is None:
+        delta_cell = '<span class="sub">-</span>'
+    else:
+        cls = "up" if delta > 0 else ("down" if delta < 0 else "")
+        growth = item.get("growth_pct")
+        pct = ""
+        if growth is not None:
+            pct = ' <span class="pct">(%s%.1f%%)</span>' % (
+                "+" if growth > 0 else "", growth)
+        delta_cell = ('<span class="delta %s">%s</span>%s'
+                      % (cls, _fmt_delta(delta), pct))
+    est = ('<span class="est" title="超大仓库分页受限，回溯值可能偏低">估</span>'
+           if item.get("estimated") else "")
+    bar = 3
+    if max_value > 0:
+        bar = max(3, int(round(abs(item.get("value") or 0) * 100.0 / max_value)))
+    desc = ('<div class="desc">%s</div>' % _esc(item.get("description"))
+            if item.get("description") else "")
+    lang = ('<span class="lang">%s</span>' % _esc(item.get("language"))
+            if item.get("language") else "")
+    name = item.get("full_name") or ""
+    return (
+        '<tr>'
+        '<td class="rk%s">%d</td>'
+        '<td class="proj">'
+        '<a href="https://github.com/%s" target="_blank" rel="noopener">%s</a>%s%s%s'
+        '<div class="meter"><i style="width:%d%%"></i></div>'
+        '</td>'
+        '<td class="num">%s</td>'
+        '<td class="num hide-sm">%s</td>'
+        '<td class="hide-sm">%s</td>'
+        '</tr>'
+        % (" top" if rank <= 3 else "", rank, _esc(name), _esc(name), lang, est, desc,
+           bar, fmt_stars(item.get("stars")), delta_cell, sparkline(item.get("series")))
+    )
+
+
+def _card_html(title, meta, items, board_type):
+    if items:
+        rows = "".join(_row_html(it, i, max(abs(x.get("value") or 0) for x in items))
+                       for i, it in enumerate(items, 1))
+        body = (
+            '<table><thead><tr><th>#</th><th>项目</th><th class="num">Star</th>'
+            '<th class="num hide-sm">窗口增量</th><th class="hide-sm">走势</th></tr>'
+            '</thead><tbody>%s</tbody></table>' % rows
+        )
+    else:
+        body = ('<div class="none">该领域暂无%s数据（趋势榜需要至少两天的快照）</div>'
+                % ("趋势" if board_type == "trend" else "热度"))
+    return ('<section class="card"><div class="card-head"><h2>%s</h2>'
+            '<div class="meta">%s</div></div>%s</section>'
+            % (_esc(title), _esc(meta), body))
+
+
+def static_boards(payload, period_key=None):
+    """把默认视图编译成静态 HTML（脚本不可用时的兜底内容）。"""
+    periods = list(payload["periods"])
+    period_key = period_key or periods[0]
+    label = payload["periods"][period_key]["label"]
+    boards = payload["boards"].get(period_key, {})
+    parts = []
+    for domain in payload["domains"]:
+        board = boards.get(domain["key"]) or {"hot": [], "trend": []}
+        for board_type, suffix in (("trend", "趋势榜"), ("hot", "热度榜")):
+            items = board.get(board_type) or []
+            parts.append(_card_html(
+                "%s · %s" % (domain["name"], suffix),
+                "%s · %d 条" % (label, len(items)), items, board_type))
+    return "".join(parts)
+
+
 # ---------------------------------------------------------------- 数据准备
 def build_payload(conn, periods=None, top_n=None, domains=None):
     """把三个窗口的榜单整理成前端直接可用的结构。"""
@@ -207,6 +303,15 @@ TEMPLATE = r"""<!DOCTYPE html>
 </style>
 </head>
 <body>
+<noscript>
+  <style>
+    .controls { display: none !important; }
+  </style>
+  <div style="background:#eef2ff;border-bottom:1px solid #b9c6ff;padding:10px 24px;font-size:12.5px;color:#1a3fa8;">
+    当前环境未执行脚本，下面显示的是<b>周榜的静态快照</b>（每个领域：趋势榜 + 热度榜）。
+    用浏览器直接打开本文件即可获得完整交互：时间窗切换、榜单切换、领域筛选、关键字搜索。
+  </div>
+</noscript>
 <header>
   <h1>GitHub AI 开源热点雷达</h1>
   <div class="sub">
@@ -226,7 +331,7 @@ TEMPLATE = r"""<!DOCTYPE html>
 
 <main>
   <div id="hint"></div>
-  <div class="grid" id="boards"></div>
+  <div class="grid" id="boards">__STATIC_BOARDS__</div>
 </main>
 
 <footer>
@@ -457,6 +562,8 @@ def render(conn, out_path=None, periods=None, top_n=None, domains=None, verbose=
     text = text.replace("__GENERATED__", html.escape(payload["generated_at"]))
     text = text.replace("__SNAPDAYS__", str(payload["snapshot_days"]))
     text = text.replace("__REPOS__", str(payload["repo_count"]))
+    # 静态预渲染的兜底内容：脚本不可用时页面依然有实际榜单
+    text = text.replace("__STATIC_BOARDS__", static_boards(payload))
     # </script> 若出现在数据里会提前闭合脚本标签，做一次转义保险
     data_json = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
     text = text.replace("__DATA__", data_json)
