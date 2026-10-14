@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS repos (
     first_seen  TEXT,              -- ISO 日期，首次进入候选池
     updated_at  TEXT,
     summary      TEXT,             -- 一句话项目简介（summarize.py 生成）
-    summary_hash TEXT              -- 生成简介所依据内容的指纹
+    summary_hash TEXT,             -- 简介依据的"内容"指纹（描述/主题/语言）
+    summary_mode TEXT              -- 生成模式：rule 或 llm:<模型名>
 );
 
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -92,7 +93,8 @@ def migrate(conn):
     """给老库补列（SQLite 没有 ADD COLUMN IF NOT EXISTS，只能先查再改）。"""
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(repos)")}
     for name, ddl in (("summary", "TEXT"),        # 项目一句话简介
-                      ("summary_hash", "TEXT")):  # 简介依据的指纹，变了才重算
+                      ("summary_hash", "TEXT"),   # 简介依据的"内容"指纹
+                      ("summary_mode", "TEXT")):  # 生成模式：rule / llm:<模型>
         if name not in columns:
             conn.execute("ALTER TABLE repos ADD COLUMN %s %s" % (name, ddl))
 
@@ -268,17 +270,18 @@ def window_rows(conn, period):
     return [dict(r) for r in rows]
 
 
-def set_summaries(conn, pairs):
-    """批量写项目简介。pairs = [(repo_id, summary, summary_hash), ...]
+def set_summaries(conn, rows):
+    """批量写项目简介。rows = [(repo_id, summary, summary_hash, summary_mode), ...]
 
-    返回**实际被修改的行数**（而不是 len(pairs)）——曾经因为返回 len(pairs)
+    返回**实际被修改的行数**（而不是 len(rows)）——曾经因为返回 len(rows)
     掩盖了"UPDATE 没匹配到任何行"的问题，排查了很久。写完再回读一次做校验。
     """
     applied = 0
-    for repo_id, summary, summary_hash in pairs:
+    for repo_id, summary, summary_hash, summary_mode in rows:
         cursor = conn.execute(
-            "UPDATE repos SET summary=?, summary_hash=? WHERE repo_id=?",
-            (summary, summary_hash, repo_id))
+            "UPDATE repos SET summary=?, summary_hash=?, summary_mode=? "
+            "WHERE repo_id=?",
+            (summary, summary_hash, summary_mode, repo_id))
         if cursor.rowcount and cursor.rowcount > 0:
             applied += 1
     conn.commit()

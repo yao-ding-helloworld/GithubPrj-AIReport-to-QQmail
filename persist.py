@@ -26,7 +26,7 @@ TABLES = {
                     "domain", "secondary", "stars", "first_seen", "updated_at",
                     # 简介必须随 CSV 走：否则云端每次重建库都会丢掉，
                     # 于是每天重复调用 LLM（白花钱）
-                    "summary", "summary_hash"],
+                    "summary", "summary_hash", "summary_mode"],
     },
     "snapshots": {
         "file": config.SNAPSHOT_CSV,

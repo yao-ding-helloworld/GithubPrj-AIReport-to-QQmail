@@ -30,19 +30,55 @@ LAST_LLM_ERROR = [None]
 
 
 # ---------------------------------------------------------------- 指纹
-def content_hash(repo, mode_sig="rule"):
-    """简介依据的内容指纹：描述 / 主题 / 语言 / **生成模式** 变了才需要重算。
+def content_hash(repo):
+    """简介依据的**内容**指纹：描述 / 主题 / 语言。
 
-    为什么要把模式算进去：从"规则版"切到"LLM 版"时，仓库内容一个字都没变，
-    如果指纹只算内容，就会命中缓存、永远停留在旧的规则版简介上。
+    注意：这里**不把生成模式算进去**。模式单独放在 `summary_mode` 列里存，
+    这样"内容有没有变"和"生成方式有没有变"是两件可以分别判断的事——
+    混在一起会出现在云端没配 LLM 密钥时，把已有的中文简介覆盖成规则版的惨剧。
     """
     basis = "|".join([
         (repo.get("description") or "")[:400],
         ",".join(sorted(repo.get("topics") or [])),
         repo.get("language") or "",
-        "mode=" + mode_sig,
     ])
     return hashlib.sha1(basis.encode("utf-8")).hexdigest()
+
+
+def mode_signature(settings):
+    """当前生成模式的签名：rule 或 llm:<模型名>。"""
+    return ("llm:" + settings["model"]) if settings else "rule"
+
+
+def is_downgrade(from_mode, to_mode):
+    """从 LLM 版退回规则版属于**降级**。
+
+    云端如果没配 LLM 密钥（或临时调用失败），不该把已经生成好的中文简介
+    覆盖成"中文骨架 + 英文原文"。宁可让它略微过期，也不破坏已有内容。
+    """
+    return to_mode == "rule" and (from_mode or "").startswith("llm")
+
+
+def should_regenerate(repo, mode_sig, force=False):
+    """决定某个仓库的简介要不要重算，返回 (是否重算, 原因)。
+
+    把这段判断单独抽出来是为了能被单测覆盖 —— 这段逻辑同时管着"省钱"
+    （命中缓存不重复调 LLM）和"别搞坏数据"（缺密钥时不降级覆盖），
+    藏在一堆副作用里很难验证。
+    """
+    if force:
+        return True, "force"
+    if not repo.get("summary"):
+        return True, "empty"
+    same_content = (repo.get("summary_hash") or "") == content_hash(repo)
+    stored_mode = repo.get("summary_mode")
+    if same_content and stored_mode == mode_sig:
+        return False, "cached"
+    if is_downgrade(stored_mode, mode_sig):
+        return False, "keep-no-downgrade"
+    if same_content and stored_mode is None and mode_sig == "rule":
+        return False, "keep-legacy"
+    return True, "changed"
 
 
 # ---------------------------------------------------------------- 规则版
@@ -172,8 +208,7 @@ def summarize_repos(conn, repos=None, force=False, limit=None, verbose=True):
     """
     settings = env.llm_settings()
     mode = "llm" if settings else "rule"
-    # 模式进指纹：换模型或换模式都会触发重算，不会卡在旧版本上
-    mode_sig = ("llm:" + settings["model"]) if settings else "rule"
+    mode_sig = mode_signature(settings)
     limit = config.SUMMARY_LLM_LIMIT if limit is None else limit
     candidates = repos if repos is not None else list(db.iter_repos(conn))
 
@@ -182,41 +217,47 @@ def summarize_repos(conn, repos=None, force=False, limit=None, verbose=True):
     generated = 0
     llm_calls = 0
     fallbacks = 0
+    kept = 0
     domain_names = {d["key"]: d["name"] for d in config.DOMAINS}
 
     for repo in candidates:
-        digest = content_hash(repo, mode_sig)
-        if not force and repo.get("summary") and repo.get("summary_hash") == digest:
-            reused += 1
+        need, reason = should_regenerate(repo, mode_sig, force=force)
+        if not need:
+            if reason == "cached":
+                reused += 1
+            else:
+                kept += 1
             continue
 
         text = None
-        actual_sig = mode_sig
+        actual_mode = mode_sig
         if settings and llm_calls < limit:
             text = llm_summary(repo, settings)
             if text:
                 llm_calls += 1
             else:
-                # 降级项用「规则版指纹」存：下次运行会因指纹不匹配而重试 LLM，
+                # 降级项用 rule 模式标记：下次运行会因模式不同而重试 LLM，
                 # 否则失败一次就被永久缓存成规则版了。
                 fallbacks += 1
-                actual_sig = "rule"
+                actual_mode = "rule"
         if not text:
             text = rule_summary(repo, domain_names.get(repo.get("domain")))
         updates.append((repo["repo_id"], text,
-                        content_hash(repo, actual_sig)))
+                        content_hash(repo), actual_mode))
         generated += 1
 
     applied = db.set_summaries(conn, updates) if updates else 0
     total = db.count_summaries(conn)
 
     if verbose:
-        print("项目简介：新增/更新 %d 条，命中缓存 %d 条（模式：%s）"
-              % (generated, reused, mode))
+        print("项目简介：新增/更新 %d 条，命中缓存 %d 条，保留旧版 %d 条（模式：%s）"
+              % (generated, reused, kept, mode))
         print("  写入校验：实际生效 %d 行，库内有简介 %d 行" % (applied, total))
         if updates and applied == 0:
             print("  [FAIL] 有 %d 条待写却一行都没生效 —— repo_id 对不上或连接异常"
                   % len(updates))
+        if kept:
+            print("  保留旧版说明：这些仓库已有 LLM 版简介，本次以规则模式运行，不覆盖")
         if mode == "llm":
             print("  LLM 调用成功 %d 次（上限 %d），降级 %d 条"
                   % (llm_calls, limit, fallbacks))
@@ -225,7 +266,7 @@ def summarize_repos(conn, repos=None, force=False, limit=None, verbose=True):
         else:
             print("  " + env.describe_llm().replace("\n", "\n  "))
 
-    return {"mode": mode, "generated": generated, "reused": reused,
+    return {"mode": mode, "generated": generated, "reused": reused, "kept": kept,
             "applied": applied, "total": total, "fallbacks": fallbacks,
             "llm_calls": llm_calls, "error": LAST_LLM_ERROR[0]}
 
