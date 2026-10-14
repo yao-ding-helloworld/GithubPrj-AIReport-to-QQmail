@@ -15,9 +15,15 @@
 策略：
 - parent 取**远端当前 main**，保证远端历史是严格快进的线性追加，不需要 force
 - 推送前先在本地按 UTC 形态算出"预期 sha"，与 API 返回的 sha 比对（自校验）
-- 若一致，把该提交对象写进本地对象库并移动 main，让本地与远端点同一个提交
+- **默认只推代码**（`--with-data` 可关闭）：`.data/` 里的快照 CSV 由云端工作流维护，
+  本机推代码时不该把它们覆盖回旧版本
+- **不把本地分支指向 API 创建的提交**：那些对象本机没有，硬指过去会让
+  `git status` / `git log` 报 `bad tree object` / `Failed to traverse parents`。
+  本地与远端因此是两条平行线：内容一致、历史不同。要看远端 sha 查 `.data/remote_main.txt`
 
-用法：python tools/github_push.py
+用法：
+    python tools/github_push.py                # 只推代码（默认）
+    python tools/github_push.py --with-data    # 连 .data/ 快照 CSV 一起推
 """
 
 import base64
@@ -31,7 +37,6 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-import zlib
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
@@ -163,13 +168,6 @@ def api(method, path, token, payload=None):
         return None, {"error": "%s: %s" % (type(exc).__name__, exc)}
 
 
-def write_loose_object(sha, body):
-    """把对象写进本地 .git/objects，让本地 git 认得这个提交。"""
-    directory = config.ROOT / ".git" / "objects" / sha[:2]
-    directory.mkdir(parents=True, exist_ok=True)
-    (directory / sha[2:]).write_bytes(zlib.compress(body))
-
-
 def main():
     env.load_env()
     token = env.github_token()
@@ -210,7 +208,9 @@ def main():
     say("")
 
     # ---- 2. 上传 blob ----
-    code_only = "--code-only" in sys.argv
+    # 默认只推代码：.data/ 下的快照 CSV 归**云端工作流**维护，本机推代码时不该覆盖它们
+    # （否则会把云端刚提交的快照回退成本机的旧版本）。要用本机数据覆盖时加 --with-data。
+    code_only = "--with-data" not in sys.argv
     base_tree = None
     if code_only:
         status, rcommit = api("GET", "%s/git/commits/%s" % (base, remote_sha), token)
@@ -288,18 +288,23 @@ def main():
     say("[PASS] 远端 main 已更新 → %s" % new_sha)
     say("")
 
-    # ---- 6. 让本地也认这个提交（best effort）----
-    try:
-        write_loose_object(expect, body)
-        git("update-ref", "refs/heads/main", expect)
-        git("update-ref", "refs/remotes/origin/main", new_sha)
-        say("[PASS] 本地 main 已对齐 → %s" % git("rev-parse", "HEAD").strip())
-        say("       本地与远端现在是同一个提交，后续 push 不会再分叉")
-    except Exception as exc:                                # noqa: BLE001
-        say("[i] 本地对齐失败（不影响远端）：%s" % exc)
+    # ---- 6. 只记录远端 sha，**不**把本地分支指过去 ----
+    # 曾经做过"把本地 main 指向 API 创建的提交"的本地对齐，结论是**不能做**：
+    # 那个提交的 tree / parent 只存在于 GitHub，本机没有这些对象；
+    # 一旦本地分支指过去，git status 立刻报
+    #     error: bad tree object HEAD
+    #     fatal: Failed to traverse parents of commit <sha>
+    # 仓库反而变得不可用（只能靠 update-ref 手工救回）。
+    # 所以：本地 main 保持为一条独立的本地提交线，内容与远端一致、历史不同。
+    # 每次推送的 parent 都取远端当前 main，因此远端历史始终是线性快进。
+    (config.ROOT / ".data" / "remote_main.txt").write_text(new_sha + "\n",
+                                                          encoding="utf-8")
+    say("[i] 远端 sha 已记录到 .data/remote_main.txt")
+    say("    本地 main 未改动（%s）—— 本机与远端是两条**平行线**：内容一致、历史不同"
+        % git("rev-parse", "--short", "HEAD").strip())
+    say("    原因：API 创建的提交对象本机没有，硬指过去会让 git status/log 直接报错")
     say("")
-    say("下一步：仓库 Settings → Secrets and variables → Actions 添加 6 个 Secret，")
-    say("       然后到 Actions 页面手动触发 workflow。")
+    say("下一步：python tools/gh_actions.py watch   # 触发云端 workflow 并跟踪结果")
     return flush(0)
 
 
